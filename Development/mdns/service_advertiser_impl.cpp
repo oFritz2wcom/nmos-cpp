@@ -11,6 +11,15 @@
 #include <arpa/inet.h> // for htons
 #endif
 
+#ifdef USE_AVAHI
+#include <avahi-common/thread-watch.h>
+#include <avahi-common/error.h>
+#include <avahi-common/address.h>
+#include <avahi-common/alternative.h>
+#include <avahi-client/client.h>
+#include <avahi-client/publish.h>
+#endif
+
 namespace mdns_details
 {
     using namespace mdns;
@@ -46,9 +55,20 @@ namespace mdns_details
 
     struct register_address_context
     {
+#ifdef USE_AVAHI
+        register_address_context(slog::base_gate& gate) : threaded_poll(nullptr), client(nullptr), group(nullptr), interface_id(-1), gate(gate) {address.proto=AVAHI_PROTO_UNSPEC; memset(&address.data, 0, sizeof(address.data)); }
+
+        std::string host;
+        AvahiThreadedPoll* threaded_poll;
+        AvahiClient* client;
+        AvahiEntryGroup* group;
+        AvahiAddress address;
+        unsigned int interface_id;
+#endif
         slog::base_gate& gate;
     };
 
+#ifndef USE_AVAHI
     static void DNSSD_API register_address_reply(
         DNSServiceRef         sdRef,
         DNSRecordRef          recordRef,
@@ -157,6 +177,7 @@ namespace mdns_details
 
         return result;
     }
+#endif
 
     struct service
     {
@@ -243,6 +264,100 @@ namespace mdns_details
     }
 }
 
+#ifdef USE_AVAHI
+    int register_stuff(mdns_details::register_address_context* userdata);
+
+    void entry_group_callback(AvahiEntryGroup* g, AvahiEntryGroupState state, void *userdata)
+    {
+        mdns_details::register_address_context* impl = (mdns_details::register_address_context*)userdata;
+
+        assert(g);
+        assert(impl);
+
+        switch (state)
+        {
+        case AVAHI_ENTRY_GROUP_ESTABLISHED:
+            slog::log<slog::severities::info>(impl->gate, SLOG_FLF) << "AVAHI_ENTRY_GROUP_ESTABLISHED: '" << impl->host << "'";
+            break;
+        case AVAHI_ENTRY_GROUP_FAILURE:
+            slog::log<slog::severities::error>(impl->gate, SLOG_FLF) << "AVAHI_ENTRY_GROUP_FAILURE: " << avahi_strerror(avahi_client_errno(impl->client));
+            break;
+        case AVAHI_ENTRY_GROUP_COLLISION:
+            {
+                char *n;
+                n = avahi_alternative_host_name(impl->host.c_str());
+                slog::log<slog::severities::error>(impl->gate, SLOG_FLF) << "AVAHI_ENTRY_GROUP_COLLISION, pickink new name: '" << n << "'.";
+                impl->host = n;
+                register_stuff(impl);
+                break;
+            }
+        case AVAHI_ENTRY_GROUP_UNCOMMITED:
+        case AVAHI_ENTRY_GROUP_REGISTERING:
+        	break;
+        }
+
+    }
+    void client_callback(AvahiClient* c, AvahiClientState state, void* userdata)
+    {
+        mdns_details::register_address_context* impl = (mdns_details::register_address_context*)userdata;
+
+        switch (state)
+        {
+        case AVAHI_CLIENT_S_RUNNING:
+            if (register_stuff(impl) < 0)
+            {
+            	//pollquit
+            }
+            break;
+        case AVAHI_CLIENT_FAILURE:
+            slog::log<slog::severities::error>(impl->gate, SLOG_FLF) << "AVAHI_CLIENT_FAILURE";
+            break;
+        case AVAHI_CLIENT_S_REGISTERING:
+            if (nullptr != impl->group)
+            {
+                avahi_entry_group_free(impl->group);
+                impl->group = nullptr;
+            }
+            break;
+        case AVAHI_CLIENT_S_COLLISION:
+            slog::log<slog::severities::error>(impl->gate, SLOG_FLF) << "AVAHI_CLIENT_S_COLLISION";
+            break;
+        case AVAHI_CLIENT_CONNECTING:
+            slog::log<slog::severities::info>(impl->gate, SLOG_FLF) << "AVAHI_CLIENT_CONNECTING";
+            break;
+        }
+    }
+    int register_stuff(mdns_details::register_address_context* userdata)
+        {
+            assert(userdata);
+            if (!userdata)
+            {
+                return -1;
+            }
+            if (!userdata->group)
+            {
+                if (!userdata->client)
+                {
+                    return 0;
+                }
+                if (!(userdata->group = avahi_entry_group_new(userdata->client, entry_group_callback, userdata)))
+                {
+                    slog::log<slog::severities::error>(userdata->gate, SLOG_FLF) << "avahi_entry_group_new error: " << avahi_strerror(avahi_client_errno(userdata->client));
+                    return -1;
+                }
+            }
+            assert(avahi_entry_group_is_empty(userdata->group));
+
+            if (avahi_entry_group_add_address(userdata->group, userdata->interface_id, AVAHI_PROTO_UNSPEC, AVAHI_PUBLISH_NO_REVERSE, userdata->host.c_str(), &userdata->address) < 0)
+            {
+               slog::log<slog::severities::error>(userdata->gate, SLOG_FLF) << "avahi_entry_group_add_address error: " << avahi_strerror(avahi_client_errno(userdata->client));
+               return -1;
+            }
+
+            return 0;
+        }
+#endif
+
 namespace mdns
 {
     namespace details
@@ -251,9 +366,11 @@ namespace mdns
         class service_advertiser_impl_ : public service_advertiser_impl
         {
         public:
-            explicit service_advertiser_impl_(slog::base_gate& gate)
-                : client(nullptr)
-                , gate(gate)
+            explicit service_advertiser_impl_(slog::base_gate& gate) :
+#ifndef USE_AVAHI
+                client(nullptr),
+#endif
+                gate(gate)
             {
             }
 
@@ -285,12 +402,37 @@ namespace mdns
 
                 services.clear();
 
+#ifdef USE_AVAHI
+                for (unsigned int i=0; i< context.size(); i++)
+                {
+                    if (nullptr != context[i]->threaded_poll)
+                        avahi_threaded_poll_stop(context[i]->threaded_poll);
+                    if (nullptr != context[i]->group)
+                    {
+                        avahi_entry_group_free(context[i]->group);
+                        context[i]->group = nullptr;
+                    }
+                    if (nullptr != context[i]->client)
+                    {
+                        avahi_client_free(context[i]->client);
+                        context[i]->client = nullptr;
+                    }
+                    if (nullptr != context[i]->threaded_poll)
+                    {
+                        avahi_threaded_poll_free(context[i]->threaded_poll);
+                        context[i]->threaded_poll = nullptr;
+                    }
+                    delete context[i];
+                }
+                context.clear();
+#else
                 if (nullptr != client)
                 {
                     DNSServiceRefDeallocate(client);
 
                     client = nullptr;
                 }
+#endif
 
                 return pplx::task_from_result();
             }
@@ -303,7 +445,84 @@ namespace mdns
                     // they are shared between concurrent threads."
                     // See dns_sd.h
                     std::lock_guard<std::mutex> lock(mutex);
+#ifdef USE_AVAHI
+                    // the Avahi compatibility layer implementations of DNSServiceCreateConnection and DNSServiceRegisterRecord
+                    // just return kDNSServiceErr_Unsupported
+                    // see https://github.com/lathiat/avahi/blob/master/avahi-compat-libdns_sd/unsupported.c
+                    // an alternative may be to use avahi-publish -a -R {host_name} {ip_address}
+                    // see https://linux.die.net/man/1/avahi-publish-address
+
+                    // since empty host_name is valid for other functions, check that logic error here
+                    if (host_name.empty()) return false;
+
+#if BOOST_VERSION >= 106600
+                    const auto ip_address2 = boost::asio::ip::make_address(ip_address);
+#else
+                    const auto ip_address2 = boost::asio::ip::address::from_string(ip_address);
+#endif
+                    if (ip_address2.is_unspecified()) return false;
+
+                    // so far as I can tell, attempting to register a host name in a domain other than the multicast .local domain always fails
+                    // which may be the expected behaviour?
+                    mdns_details::register_address_context* pContext = nullptr;
+                    for (unsigned int i=0; i< context.size(); i++)
+                    {
+                        if (interface_id == context[i]->interface_id)
+                        {
+                            pContext = context[i];
+                            break;
+                        }
+                    }
+                    if (nullptr == pContext)
+                    {
+                        pContext = new mdns_details::register_address_context(gate);
+                        if (nullptr == pContext)
+                            return false;
+                        pContext->interface_id = interface_id;
+                        pContext->threaded_poll = avahi_threaded_poll_new();
+                        context.push_back(pContext);
+                    }
+                    pContext->host = mdns_details::make_full_name(host_name, domain);
+                    avahi_address_parse(ip_address2.to_string().c_str(), AVAHI_PROTO_UNSPEC, &pContext->address);
+                    bool result = false;
+
+                    if (nullptr == pContext->client)
+                    {
+                        int error;
+                        pContext->client = avahi_client_new(avahi_threaded_poll_get(pContext->threaded_poll), (AvahiClientFlags)0, client_callback, pContext, &error);
+                        if (nullptr == pContext->client)
+                        {
+                            slog::log<slog::severities::error>(gate, SLOG_FLF) << "avahi_client_new error: " << avahi_strerror(error);
+                        }
+                        avahi_threaded_poll_start(pContext->threaded_poll);
+                    }
+                    if (avahi_client_get_state(pContext->client) != AVAHI_CLIENT_CONNECTING)
+                    {
+                        const char *version, *hn;
+                        if (!(version = avahi_client_get_version_string(pContext->client)))
+                        {
+                            slog::log<slog::severities::error>(gate, SLOG_FLF) << "avahi_client_get_version_string error: " << avahi_strerror(avahi_client_errno(pContext->client));
+                        }
+                        if (!(hn = avahi_client_get_host_name_fqdn(pContext->client)))
+                        {
+                            slog::log<slog::severities::error>(gate, SLOG_FLF) << "avahi_client_get_host_name_fqdn error: " << avahi_strerror(avahi_client_errno(pContext->client));
+                        }
+                    }
+int ret = 0;//Todo
+                    if (ret != -1)
+                    {
+                        slog::log<slog::severities::too_much_info>(gate, SLOG_FLF) << "After avahi-publish succeeded";
+                        result = true;
+                        slog::log<slog::severities::info>(gate, SLOG_FLF) << "Registered address: " << ip_address2.to_string() << " for hostname: " << pContext->host;
+                    }
+                    else
+                    {
+                        slog::log<slog::severities::error>(gate, SLOG_FLF) << "Avahi-publish reported error: " << ret;
+                    }
+                    return result;
+#else
                     return mdns_details::register_address(client, host_name, ip_address, domain, interface_id, gate);
+#endif
                 });
             }
 
@@ -328,7 +547,11 @@ namespace mdns
             }
 
         private:
+#ifdef USE_AVAHI
+            std::vector<mdns_details::register_address_context*> context;
+#else
             DNSServiceRef client;
+#endif
             std::vector<mdns_details::service> services;
             std::mutex mutex;
             slog::base_gate& gate;

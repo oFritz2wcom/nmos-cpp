@@ -31,6 +31,7 @@ target_compile_definitions(
     SLOG_STATIC
     SLOG_LOGGING_SEVERITY=${SLOG_LOGGING_SEVERITY}
     BST_THREAD_BOOST # provide bst::chrono::duration, etc. using either std:: or boost:: symbols
+    BST_FILESYSTEM_BOOST
     )
 if(CMAKE_CXX_COMPILER_ID MATCHES GNU)
     if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.8)
@@ -75,6 +76,11 @@ add_library(
 
 source_group("mdns\\Source Files" FILES ${MDNS_SOURCES})
 source_group("mdns\\Header Files" FILES ${MDNS_HEADERS})
+
+if(Avahi_FOUND)
+    message(STATUS "USE_AVAHI")
+    set_target_properties(mdns PROPERTIES COMPILE_DEFINITIONS "USE_AVAHI")
+endif()
 
 target_link_libraries(
     mdns PRIVATE
